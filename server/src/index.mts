@@ -20,6 +20,7 @@ const sc = StringCodec();
 const nc = await connect({ servers: env.NATS_URL });
 const js = nc.jetstream();
 const jsm = await nc.jetstreamManager();
+const kv = await nc.jetstream().views.kv("airstate");
 
 // Create Express app
 const app = express();
@@ -94,12 +95,6 @@ server.on("upgrade", async (request, socket, head) => {
   }
 });
 
-const connIDMap = new WeakMap<WebSocket, string>();
-
-function getStreamName(accountID: string, key: string) {
-  return `${accountID}_${key}`;
-}
-
 async function ensureStream(streamName: string, subject: string) {
   try {
     await jsm.streams.info(streamName);
@@ -107,7 +102,7 @@ async function ensureStream(streamName: string, subject: string) {
     const streamConfig = {
       name: streamName,
       subjects: [subject],
-      storage: StorageType.File,
+      storage: StorageType.Memory,
       max_msgs_per_subject: -1,
     };
     await jsm.streams.add(streamConfig);
@@ -123,40 +118,133 @@ async function createConsumer(stream: string, consumerName: string) {
     });
     return consumer;
   } catch (err) {
-    console.log("err on create consumer", err);
+    logger.error("err on create consumer", err);
     throw err;
   }
 }
 
-async function getInitialState(stream: string) {
-  const info = await jsm.streams
-    .getMessage(stream, { seq: 1 })
-    .catch(() => null);
+async function getInitialState(stream: string): Promise<Uint8Array | null> {
+  const checkpointKey = `checkpoint_${stream}`;
+  const mergedStateKey = `merged_${stream}`;
 
-  if (!info) {
-    return [];
+  try {
+    const checkpointEntry = await kv.get(checkpointKey);
+    const mergedStateEntry = await kv.get(mergedStateKey);
+
+    if (
+      checkpointEntry &&
+      mergedStateEntry &&
+      checkpointEntry.string() &&
+      mergedStateEntry.string()
+    ) {
+      const lastSeq = parseInt(checkpointEntry.string());
+
+      const mergedState = Uint8Array.from(
+        Buffer.from(mergedStateEntry.string(), "base64")
+      );
+      const newMessages = await getMessages(stream, lastSeq + 1);
+
+      if (newMessages.length > 0) {
+        const finalMerged = Y.mergeUpdatesV2([mergedState, ...newMessages]);
+        await updateCheckpoint(
+          stream,
+          lastSeq + newMessages.length,
+          finalMerged
+        );
+
+        return finalMerged;
+      }
+
+      return mergedState;
+    }
+  } catch (err) {
+    logger.error("Error reading from KV store:", err);
   }
-  const messages = [];
-  let seq = 1;
+
+  const messages = await getMessages(stream, 1);
+  if (messages.length > 0) {
+    const merged = Y.mergeUpdatesV2(messages);
+    await updateCheckpoint(stream, messages.length, merged);
+    return merged;
+  }
+
+  return null;
+}
+
+async function getMessages(
+  stream: string,
+  startSeq: number
+): Promise<Uint8Array[]> {
+  const BATCH_SIZE = 1000;
+  let seq = startSeq;
+  const allMessages: Uint8Array[] = [];
+
+  if (startSeq === 1) {
+    const info = await jsm.streams
+      .getMessage(stream, { seq: 1 })
+      .catch(() => null);
+
+    if (!info) {
+      return [];
+    }
+  }
+
   while (true) {
     try {
-      const m = await jsm.streams.getMessage(stream, { seq });
-      const encodedUpdateB64 = sc.decode(m.data);
-      const b = Buffer.from(encodedUpdateB64, "base64");
-      const uint8arr = Uint8Array.from(b);
-      messages.push(uint8arr);
-      seq++;
-    } catch {
+      const messages = await Promise.all(
+        Array.from({ length: BATCH_SIZE }, (_, i) =>
+          jsm.streams.getMessage(stream, { seq: seq + i }).catch(() => null)
+        )
+      );
+
+      const validMessages = messages.filter(
+        (m): m is NonNullable<typeof m> => m !== null
+      );
+
+      if (validMessages.length === 0) {
+        break;
+      }
+
+      const batchUpdates = validMessages.map((m) => {
+        const encodedUpdateB64 = sc.decode(m.data);
+        const b = Buffer.from(encodedUpdateB64, "base64");
+        return Uint8Array.from(b);
+      });
+
+      allMessages.push(...batchUpdates);
+      seq += validMessages.length;
+
+      if (validMessages.length < BATCH_SIZE) {
+        break;
+      }
+    } catch (err) {
+      logger.error("Error processing messages:", err);
       break;
     }
   }
-  return messages;
+
+  return allMessages;
+}
+
+async function updateCheckpoint(
+  stream: string,
+  seq: number,
+  mergedState: Uint8Array
+): Promise<void> {
+  const checkpointKey = `checkpoint_${stream}`;
+  const mergedStateKey = `merged_${stream}`;
+
+  try {
+    await kv.put(checkpointKey, seq.toString());
+    await kv.put(mergedStateKey, Buffer.from(mergedState).toString("base64"));
+  } catch (err) {
+    logger.error("Error updating checkpoint:", err);
+  }
 }
 
 wss.on("connection", async (ws, request) => {
   const url = new URL(`https://airstate${request.url}`);
   const connID = nanoid();
-  connIDMap.set(ws, connID);
   const h = headers();
   h.set("connID", connID);
 
@@ -212,17 +300,21 @@ wss.on("connection", async (ws, request) => {
     return;
   }
   const key = `${accountID}__${clientSentKey}`;
-  const streamName = getStreamName(accountID || "test", key);
-  const subject = `room.${accountID}_${key}`;
+  const streamName = key;
+  const subject = `room.${key}`;
   const consumerName = `consumer_${connID}`;
+  const keyConnections = new Map<string, Set<WebSocket>>();
+
+  if (!keyConnections.has(key)) {
+    keyConnections.set(key, new Set());
+  }
+  keyConnections.get(key)!.add(ws);
 
   ws.on("message", async (message) => {
     const m = JSON.parse(message.toString("utf-8"));
-    console.log("MESSAGE>>>>>>>>", m);
     if (m.type === "init") {
-      console.log("entered init block");
-      const initialStates = await getInitialState(streamName);
-      if (initialStates.length === 0) {
+      const initialState = await getInitialState(streamName);
+      if (!initialState) {
         try {
           await js.publish(subject, sc.encode(m.initialEncodedState), {
             headers: h,
@@ -233,7 +325,7 @@ wss.on("connection", async (ws, request) => {
             })
           );
         } catch (err) {
-          console.error("Error publishing initial state:", err);
+          logger.error("Error publishing initial state:", err);
           ws.send(
             JSON.stringify({
               type: "error",
@@ -242,11 +334,10 @@ wss.on("connection", async (ws, request) => {
           );
         }
       } else {
-        const mergedUpdates = Y.mergeUpdatesV2(initialStates);
         ws.send(
           JSON.stringify({
             type: "init",
-            initialEncodedState: Buffer.from(mergedUpdates).toString("base64"),
+            initialEncodedState: Buffer.from(initialState).toString("base64"),
           })
         );
       }
@@ -256,16 +347,31 @@ wss.on("connection", async (ws, request) => {
           headers: h,
         });
       } catch (err) {
-        console.log(err);
+        logger.info(err);
       }
     }
   });
 
   ws.on("close", async () => {
+    logger.info("closing connection");
     try {
-      // Delete the consumer from NATS
       await jsm.consumers.delete(streamName, consumerName);
-      console.log("Consumer deleted successfully");
+      logger.info("Consumer deleted successfully");
+      const connections = keyConnections.get(key);
+      if (connections) {
+        connections.delete(ws);
+        if (connections.size === 0) {
+          keyConnections.delete(key);
+          try {
+            await jsm.streams.delete(streamName);
+            await kv.delete(`checkpoint_${streamName}`);
+            await kv.delete(`merged_${streamName}`);
+            logger.info(`Stream ${streamName} deleted successfully`);
+          } catch (err) {
+            logger.error("Error deleting stream:", err);
+          }
+        }
+      }
     } catch (err) {
       logger.error("Error deleting consumer:", err);
     }

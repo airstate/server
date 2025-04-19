@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  nats:
+    image: nats:2.11.1
+    container_name: nats
+    ports:
+      - "4222:4222" # Client connections
+      - "8222:8222" # Monitoring
+    volumes:
+      - ./nats-server.conf:/etc/nats/nats-server.conf
+      - ./data:/data
+    command: ["-c", "/etc/nats/nats-server.conf", "--server_name", "nats"]

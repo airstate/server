@@ -127,10 +127,10 @@ async function getMergedUpdate(
       updates.push(Uint8Array.from(Buffer.from(sc.decode(msg.data), "base64")));
       currSeq++;
     }
-    lastMerged = Y.mergeUpdatesV2([lastMerged, ...updates]);
-    if (updates.length < 1000) {
+    if (updates.length === 0) {
       break;
     }
+    lastMerged = Y.mergeUpdatesV2([lastMerged, ...updates]);
   }
   await jsm.consumers.delete(streamName, ephemeralConsumerName);
   return [Buffer.from(lastMerged).toString("base64"), currSeq];

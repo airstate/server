@@ -1,5 +1,5 @@
 {
-    "name": "@airstate/socket-server",
+    "name": "@airstate/server",
     "version": "0.0.1",
     "description": "The main production socket server for AirState",
     "main": "./dist/index.mjs",

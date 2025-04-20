@@ -7,13 +7,27 @@ import { nanoid } from 'nanoid';
 import express from 'express';
 import cookie from 'cookie';
 import { returnOf } from 'scope-utilities';
-import { connect, StringCodec, StorageType, AckPolicy, DeliverPolicy, headers, NatsError } from 'nats';
+import {
+    connect,
+    StringCodec,
+    StorageType,
+    AckPolicy,
+    DeliverPolicy,
+    headers,
+    NatsError,
+} from 'nats';
+import { createHash } from 'crypto';
 
 const stringCodec = StringCodec();
-const natsConnection = await connect({ servers: env.NATS_URL });
+const natsConnection = await connect({
+    servers: env.NATS_URLS.split(',').map((url) => url.trim()),
+});
+
 const jetStreamClient = natsConnection.jetstream();
 const jetStreamManager = await natsConnection.jetstreamManager();
-const jetStreamKV = await natsConnection.jetstream().views.kv('use-shared-state', { storage: StorageType.File });
+const jetStreamKV = await natsConnection
+    .jetstream()
+    .views.kv('use-shared-state', { storage: StorageType.File });
 
 // Create Express app
 const app = express();
@@ -31,19 +45,26 @@ const webSocketServer = new WebSocketServer({
 });
 
 const clientIdentifiers = new WeakMap<WebSocket, string>();
-const connectionAccountIDs = new WeakMap<WebSocket, string | null | undefined>();
+const connectionAccountIDs = new WeakMap<
+    WebSocket,
+    string | null | undefined
+>();
 
 server.on('upgrade', async (request, socket, head) => {
     const url = new URL(`https://airstate${request.url}`);
     const cookies = cookie.parse(request.headers.cookie ?? '');
 
     const clientIdentifier =
-        'airstate_client_identifier' in cookies && cookies.airstate_client_identifier
+        'airstate_client_identifier' in cookies &&
+        cookies.airstate_client_identifier
             ? cookies.airstate_client_identifier
             : nanoid();
 
     const accountID = await returnOf(async () => {
-        if (url.searchParams.has('app-key') && url.searchParams.get('app-key')) {
+        if (
+            url.searchParams.has('app-key') &&
+            url.searchParams.get('app-key')
+        ) {
             try {
                 const checkerRequest = await fetch(
                     `${env.CORE_API_BASE_URL}/http/getUserFromKey?appKey=${url.searchParams.get('app-key')}`,
@@ -61,7 +82,10 @@ server.on('upgrade', async (request, socket, head) => {
 
     if (url.pathname.startsWith('/y/')) {
         webSocketServer.once('headers', (headers, request) => {
-            if (!('airstate_client_identifier' in cookies) || !cookies.airstate_client_identifier) {
+            if (
+                !('airstate_client_identifier' in cookies) ||
+                !cookies.airstate_client_identifier
+            ) {
                 headers.push(
                     `Set-Cookie: airstate_client_identifier=${clientIdentifier}; Path=/; Domain=; HttpOnly; SameSite=None; Secure`,
                 );
@@ -94,10 +118,15 @@ async function getMergedUpdate(
         inactive_threshold: 60 * 1e9,
     });
 
-    let lastMerged: Uint8Array = Uint8Array.from(Buffer.from(lastMergedUpdate, 'base64'));
+    let lastMerged: Uint8Array = Uint8Array.from(
+        Buffer.from(lastMergedUpdate, 'base64'),
+    );
     let currSeq = lastSeq;
 
-    const ephemeralStreamConsumer = await jetStreamClient.consumers.get(streamName, ephemeralConsumerName);
+    const ephemeralStreamConsumer = await jetStreamClient.consumers.get(
+        streamName,
+        ephemeralConsumerName,
+    );
 
     while (true) {
         let updates: Uint8Array[] = [];
@@ -111,7 +140,14 @@ async function getMergedUpdate(
         });
 
         for await (const streamMessage of streamMessages) {
-            updates.push(Uint8Array.from(Buffer.from(stringCodec.decode(streamMessage.data), 'base64')));
+            updates.push(
+                Uint8Array.from(
+                    Buffer.from(
+                        stringCodec.decode(streamMessage.data),
+                        'base64',
+                    ),
+                ),
+            );
             currSeq++;
         }
 
@@ -150,11 +186,19 @@ async function getInitialState(
 
         return [clientSentInitialState, 0, true];
     } catch (err) {
-        if (err instanceof NatsError && err.code === '400' && err.message.includes('wrong last sequence')) {
-            const coordinatorValue = await jetStreamKV.get(`${streamName}__coordinator`);
+        if (
+            err instanceof NatsError &&
+            err.code === '400' &&
+            err.message.includes('wrong last sequence')
+        ) {
+            const coordinatorValue = await jetStreamKV.get(
+                `${streamName}__coordinator`,
+            );
 
             if (coordinatorValue && coordinatorValue.string()) {
-                const coordinatorValueJSON = JSON.parse(coordinatorValue.string()) as {
+                const coordinatorValueJSON = JSON.parse(
+                    coordinatorValue.string(),
+                ) as {
                     lastSeq: number;
                     lastMergedUpdate: string;
                 };
@@ -202,7 +246,10 @@ webSocketServer.on('connection', async (ws, request) => {
 
     const accountID = connectionAccountIDs.get(ws);
 
-    if (url.searchParams.has('host') && url.searchParams.get('host')!.indexOf('localhost') > -1) {
+    if (
+        url.searchParams.has('host') &&
+        url.searchParams.get('host')!.indexOf('localhost') > -1
+    ) {
         ws.send(
             JSON.stringify({
                 type: 'console',
@@ -242,13 +289,17 @@ webSocketServer.on('connection', async (ws, request) => {
     }
 
     const clientSentKey: string = url.searchParams.get('key') as string;
+    const hashedClientSentKey: string = createHash('sha256')
+        .update(clientSentKey)
+        .digest('hex');
 
     if (!clientSentKey) {
         ws.close();
         return;
     }
 
-    const key = `${accountID}__${clientSentKey}`;
+    const key = `${accountID}__${hashedClientSentKey}`;
+
     const streamName = key;
     const subject = `room.${key}`;
     const consumerName = `consumer_${connID}`;
@@ -286,8 +337,13 @@ webSocketServer.on('connection', async (ws, request) => {
                     opt_start_seq: lastSeq + 1,
                 });
 
-                const steamConsumer = await jetStreamClient.consumers.get(streamName, consumerName);
-                const streamMessages = await steamConsumer.consume({ max_messages: 1 });
+                const steamConsumer = await jetStreamClient.consumers.get(
+                    streamName,
+                    consumerName,
+                );
+                const streamMessages = await steamConsumer.consume({
+                    max_messages: 1,
+                });
 
                 for await (const streamMessage of streamMessages) {
                     const updateConnID = streamMessage.headers?.get('connID');
@@ -296,7 +352,9 @@ webSocketServer.on('connection', async (ws, request) => {
                         ws.send(
                             JSON.stringify({
                                 type: 'update',
-                                encodedUpdate: stringCodec.decode(streamMessage.data),
+                                encodedUpdate: stringCodec.decode(
+                                    streamMessage.data,
+                                ),
                             }),
                         );
                     }
@@ -317,9 +375,13 @@ webSocketServer.on('connection', async (ws, request) => {
             }
         } else if (wsMessage.type === 'update') {
             try {
-                await jetStreamClient.publish(subject, stringCodec.encode(wsMessage.encodedUpdate), {
-                    headers: publishHeaders,
-                });
+                await jetStreamClient.publish(
+                    subject,
+                    stringCodec.encode(wsMessage.encodedUpdate),
+                    {
+                        headers: publishHeaders,
+                    },
+                );
             } catch (err) {
                 logger.error('Failed to publish update:', err);
             }

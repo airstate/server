@@ -5,8 +5,10 @@ export const env = createEnv({
     server: {
         NODE_ENV: z.enum(['development', 'production']).default('development'),
         SOCKET_SERVER_PORT: z.string().default('12006'),
-        CORE_API_BASE_URL: z.string().default('http://localhost:12002'),
+        CONFIG_API_URL: z.string().default('http://localhost:12002'),
         NATS_URLS: z.string().default('nats://localhost:4222'),
+        SHARED_SIGNING_KEY: z.string().optional(),
+        DEFAULT_STATE_PERMISSION: z.enum(['read', 'read-write', 'none']).default('read-write'),
     },
     runtimeEnv: process.env,
 });

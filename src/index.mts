@@ -48,7 +48,7 @@ server.on('upgrade', async (request, socket, head) => {
         if (url.searchParams.has('app-key') && url.searchParams.get('app-key')) {
             try {
                 const checkerRequest = await fetch(
-                    `${env.CORE_API_BASE_URL}/http/getUserFromKey?appKey=${url.searchParams.get('app-key')}`,
+                    `${env.CONFIG_API_URL}/http/getConfigFromKey?appKey=${url.searchParams.get('app-key')}`,
                 );
 
                 const checkerResponse = await checkerRequest.json();

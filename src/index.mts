@@ -2,13 +2,13 @@ import { env } from './env.mjs';
 import { logger } from './logger.mjs';
 import { createServer } from 'node:http';
 import { type WebSocket, WebSocketServer } from 'ws';
-import * as Y from 'yjs';
 import { nanoid } from 'nanoid';
 import express from 'express';
 import cookie from 'cookie';
 import { returnOf } from 'scope-utilities';
-import { connect, StringCodec, StorageType, AckPolicy, DeliverPolicy, headers, NatsError } from 'nats';
+import { AckPolicy, connect, DeliverPolicy, headers, StorageType, StringCodec } from 'nats';
 import { createHash } from 'crypto';
+import { getInitialState } from './shared-state/state.mjs';
 
 const stringCodec = StringCodec();
 const natsConnection = await connect({
@@ -25,7 +25,7 @@ const server = createServer(app);
 
 // Basic route for health check
 app.get('/', (req, res) => {
-    res.json({ status: 'ok', service: 'airstate-socket-server' });
+    res.json({ status: 'ok', service: 'airstate-server' });
 });
 
 const webSocketServer = new WebSocketServer({
@@ -80,120 +80,6 @@ server.on('upgrade', async (request, socket, head) => {
         socket.end();
     }
 });
-
-async function getMergedUpdate(
-    streamName: string,
-    lastSeq: number,
-    lastMergedUpdate: string,
-): Promise<[string, number]> {
-    const ephemeralConsumerName = `coordinator_consumer_${nanoid()}`;
-
-    await jetStreamManager.consumers.add(streamName, {
-        name: ephemeralConsumerName,
-        deliver_policy: DeliverPolicy.StartSequence,
-        opt_start_seq: lastSeq + 1,
-        ack_policy: AckPolicy.None,
-        inactive_threshold: 60 * 1e9,
-    });
-
-    let lastMerged: Uint8Array = Uint8Array.from(Buffer.from(lastMergedUpdate, 'base64'));
-    let currSeq = lastSeq;
-
-    const ephemeralStreamConsumer = await jetStreamClient.consumers.get(streamName, ephemeralConsumerName);
-
-    while (true) {
-        let updates: Uint8Array[] = [];
-
-        // TODO: optimize this such that we first read the length of the
-        //       stream, and then request the appropriate amount of `max_messages`
-        //       when calling `fetch`
-        const streamMessages = await ephemeralStreamConsumer.fetch({
-            max_messages: 1000,
-            expires: 1000,
-        });
-
-        for await (const streamMessage of streamMessages) {
-            updates.push(Uint8Array.from(Buffer.from(stringCodec.decode(streamMessage.data), 'base64')));
-            currSeq++;
-        }
-
-        if (updates.length === 0) {
-            break;
-        }
-
-        lastMerged = Y.mergeUpdatesV2([lastMerged, ...updates]);
-    }
-
-    await jetStreamManager.consumers.delete(streamName, ephemeralConsumerName);
-
-    return [Buffer.from(lastMerged).toString('base64'), currSeq];
-}
-
-async function getInitialState(
-    streamName: string,
-    subject: string,
-    clientSentInitialState: string,
-): Promise<[string, number, boolean]> {
-    try {
-        await jetStreamKV.create(
-            `${streamName}__coordinator`,
-            JSON.stringify({
-                lastSeq: 0,
-                lastMergedUpdate: clientSentInitialState,
-            }),
-        );
-
-        await jetStreamManager.streams.add({
-            name: streamName,
-            subjects: [subject],
-            storage: StorageType.File,
-            max_msgs_per_subject: -1,
-        });
-
-        return [clientSentInitialState, 0, true];
-    } catch (err) {
-        if (err instanceof NatsError && err.code === '400' && err.message.includes('wrong last sequence')) {
-            const coordinatorValue = await jetStreamKV.get(`${streamName}__coordinator`);
-
-            if (coordinatorValue && coordinatorValue.string()) {
-                const coordinatorValueJSON = JSON.parse(coordinatorValue.string()) as {
-                    lastSeq: number;
-                    lastMergedUpdate: string;
-                };
-
-                try {
-                    const [mergedUpdate, lastSeq] = await getMergedUpdate(
-                        streamName,
-                        coordinatorValueJSON.lastSeq,
-                        coordinatorValueJSON.lastMergedUpdate,
-                    );
-
-                    await jetStreamKV.put(
-                        `${streamName}__coordinator`,
-                        JSON.stringify({
-                            lastSeq,
-                            lastMergedUpdate: mergedUpdate,
-                        }),
-                    );
-
-                    return [mergedUpdate, lastSeq, false];
-                } catch (mergeErr) {
-                    if (
-                        mergeErr instanceof NatsError &&
-                        mergeErr.code === '404' &&
-                        mergeErr.message.includes('stream not found')
-                    ) {
-                        await jetStreamKV.delete(`${streamName}__coordinator`);
-                    }
-
-                    throw mergeErr;
-                }
-            }
-        }
-
-        throw err;
-    }
-}
 
 webSocketServer.on('connection', async (ws, request) => {
     const url = new URL(`https://airstate${request.url}`);
@@ -263,6 +149,9 @@ webSocketServer.on('connection', async (ws, request) => {
         if (wsMessage.type === 'init') {
             try {
                 const [initialState, lastSeq, isFirst] = await getInitialState(
+                    jetStreamClient,
+                    jetStreamManager,
+                    jetStreamKV,
                     streamName,
                     subject,
                     wsMessage.initialEncodedState,

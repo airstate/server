@@ -6,10 +6,11 @@ import { nanoid } from 'nanoid';
 import express from 'express';
 import cookie from 'cookie';
 import { returnOf } from 'scope-utilities';
-import { AckPolicy, connect, DeliverPolicy, headers, StorageType, StringCodec } from 'nats';
+import { AckPolicy, DeliverPolicy, headers } from 'nats';
 import { createHash } from 'crypto';
 import { getInitialState } from './shared-state/state.mjs';
 import { createServices } from './services.mjs';
+import { TClientMeta } from './types/ws.mjs';
 
 const services = await createServices();
 
@@ -26,8 +27,7 @@ const webSocketServer = new WebSocketServer({
     noServer: true,
 });
 
-const clientIdentifiers = new WeakMap<WebSocket, string>();
-const connectionAccountIDs = new WeakMap<WebSocket, string | null | undefined>();
+const clientMeta = new WeakMap<WebSocket, TClientMeta>();
 
 server.on('upgrade', async (request, socket, head) => {
     const url = new URL(`https://airstate${request.url}`);
@@ -65,8 +65,10 @@ server.on('upgrade', async (request, socket, head) => {
         });
 
         webSocketServer.handleUpgrade(request, socket, head, (ws) => {
-            clientIdentifiers.set(ws, clientIdentifier);
-            connectionAccountIDs.set(ws, accountID);
+            clientMeta.set(ws, {
+                clientIdentifier: clientIdentifier,
+                accountID: accountID,
+            });
 
             webSocketServer.emit('connection', ws, request);
         });
@@ -82,7 +84,7 @@ webSocketServer.on('connection', async (ws, request) => {
     const publishHeaders = headers();
     publishHeaders.set('connID', connID);
 
-    const accountID = connectionAccountIDs.get(ws);
+    const { accountID } = clientMeta.get(ws)!;
 
     if (url.searchParams.has('host') && url.searchParams.get('host')!.indexOf('localhost') > -1) {
         ws.send(

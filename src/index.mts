@@ -11,6 +11,7 @@ import { createHash } from 'crypto';
 import { getInitialState } from './shared-state/state.mjs';
 import { createServices } from './services.mjs';
 import { TClientMeta } from './types/ws.mjs';
+import { configSchema } from './schema/config.mjs';
 
 const services = await createServices();
 
@@ -24,54 +25,66 @@ app.get('/', (req, res) => {
 });
 
 const webSocketServer = new WebSocketServer({
+    path: '/connect',
     noServer: true,
 });
 
 const clientMeta = new WeakMap<WebSocket, TClientMeta>();
 
 server.on('upgrade', async (request, socket, head) => {
-    const url = new URL(`https://airstate${request.url}`);
-    const cookies = cookie.parse(request.headers.cookie ?? '');
+    if (webSocketServer.shouldHandle(request)) {
+        const cookies = cookie.parse(request.headers.cookie ?? '');
 
-    const clientIdentifier =
-        'airstate_client_identifier' in cookies && cookies.airstate_client_identifier
-            ? cookies.airstate_client_identifier
-            : nanoid();
+        const resolvedConfig = await returnOf(async () => {
+            const url = new URL(`https://airstate${request.url}`);
+            const appKey = url.searchParams.get('app-key')?.trim();
+            const joiningToken = url.searchParams.get('joining-token');
 
-    const accountID = await returnOf(async () => {
-        if (url.searchParams.has('app-key') && url.searchParams.get('app-key')) {
-            try {
-                const checkerRequest = await fetch(
-                    `${env.CONFIG_API_URL}/http/getConfigFromKey?appKey=${url.searchParams.get('app-key')}`,
-                );
+            if (appKey) {
+                try {
+                    const configRequestURL = new URL(`${env.CONFIG_API_URL}/http/getConfigFromKey`);
+                    configRequestURL.searchParams.set('appKey', appKey);
 
-                const checkerResponse = await checkerRequest.json();
-                return checkerResponse.data.userId as string;
-            } catch {
-                return null;
-            }
-        } else {
-            return undefined;
-        }
-    });
+                    if (joiningToken) {
+                        configRequestURL.searchParams.set('joiningToken', joiningToken);
+                    }
 
-    if (url.pathname.startsWith('/y/')) {
-        webSocketServer.once('headers', (headers, request) => {
-            if (!('airstate_client_identifier' in cookies) || !cookies.airstate_client_identifier) {
-                headers.push(
-                    `Set-Cookie: airstate_client_identifier=${clientIdentifier}; Path=/; Domain=; HttpOnly; SameSite=None; Secure`,
-                );
+                    const configRequest = await fetch(`${configRequestURL}`);
+                    return configSchema.parse(await configRequest.json());
+                } catch (error) {
+                    logger.error(`could not get config for ${appKey}`, error);
+                    return null;
+                }
+            } else {
+                return {};
             }
         });
 
-        webSocketServer.handleUpgrade(request, socket, head, (ws) => {
-            clientMeta.set(ws, {
-                clientIdentifier: clientIdentifier,
-                accountID: accountID,
+        if (resolvedConfig) {
+            const clientIdentifier =
+                'airstate_client_identifier' in cookies && cookies.airstate_client_identifier
+                    ? cookies.airstate_client_identifier
+                    : nanoid();
+
+            webSocketServer.once('headers', (headers, request) => {
+                if (!('airstate_client_identifier' in cookies) || !cookies.airstate_client_identifier) {
+                    headers.push(
+                        `Set-Cookie: airstate_client_identifier=${clientIdentifier}; Path=/; Domain=; HttpOnly; SameSite=None; Secure`,
+                    );
+                }
             });
 
-            webSocketServer.emit('connection', ws, request);
-        });
+            webSocketServer.handleUpgrade(request, socket, head, (ws) => {
+                clientMeta.set(ws, {
+                    clientIdentifier: clientIdentifier,
+                    config: resolvedConfig,
+                });
+
+                webSocketServer.emit('connection', ws, request);
+            });
+        } else {
+            socket.end();
+        }
     } else {
         socket.end();
     }
@@ -84,7 +97,9 @@ webSocketServer.on('connection', async (ws, request) => {
     const publishHeaders = headers();
     publishHeaders.set('connID', connID);
 
-    const { accountID } = clientMeta.get(ws)!;
+    const {
+        config: { accounting_identifier: accountingIdentifier },
+    } = clientMeta.get(ws)!;
 
     if (url.searchParams.has('host') && url.searchParams.get('host')!.indexOf('localhost') > -1) {
         ws.send(
@@ -99,7 +114,7 @@ webSocketServer.on('connection', async (ws, request) => {
         );
     }
 
-    if (accountID === undefined) {
+    if (accountingIdentifier === undefined) {
         ws.send(
             JSON.stringify({
                 type: 'console',
@@ -133,7 +148,7 @@ webSocketServer.on('connection', async (ws, request) => {
         return;
     }
 
-    const key = `${accountID}__${hashedClientSentKey}`;
+    const key = `${accountingIdentifier}__${hashedClientSentKey}`;
 
     const streamName = key;
     const subject = `room.${key}`;

@@ -1,4 +1,6 @@
+import { TConfig } from '../schema/config.mjs';
+
 export type TClientMeta = {
     clientIdentifier: string;
-    accountID?: string | null;
+    config: TConfig;
 };

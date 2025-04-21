@@ -1,7 +1,7 @@
 import { env } from './env.mjs';
 import { logger } from './logger.mjs';
 import { createServer } from 'node:http';
-import { type WebSocket, WebSocketServer } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import { nanoid } from 'nanoid';
 import express from 'express';
 import cookie from 'cookie';
@@ -90,6 +90,20 @@ server.on('upgrade', async (request, socket, head) => {
     }
 });
 
+export function send(ws: WebSocket, message: string) {
+    try {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(message);
+            return true;
+        } else {
+            return false;
+        }
+    } catch (error) {
+        logger.error(`could not send message`, error);
+        return false;
+    }
+}
+
 webSocketServer.on('connection', async (ws, request) => {
     const url = new URL(`https://airstate${request.url}`);
     const connID = nanoid();
@@ -97,45 +111,61 @@ webSocketServer.on('connection', async (ws, request) => {
     const publishHeaders = headers();
     publishHeaders.set('connID', connID);
 
-    const {
-        config: { accounting_identifier: accountingIdentifier },
-    } = clientMeta.get(ws)!;
+    const meta = clientMeta.get(ws)!;
 
     if (url.searchParams.has('host') && url.searchParams.get('host')!.indexOf('localhost') > -1) {
-        ws.send(
-            JSON.stringify({
-                type: 'console',
-                level: 'warn',
-                logs: [
-                    '%cNote: You are using a very early preview version of useSharedState by AirState.',
-                    'padding: 0.5rem 0 0.5rem 0;',
-                ],
-            }),
-        );
+        if (
+            !send(
+                ws,
+                JSON.stringify({
+                    type: 'console',
+                    level: 'warn',
+                    logs: [
+                        '%cNote: You are using a very early preview version of AirState',
+                        'padding: 0.5rem 0 0.5rem 0;',
+                    ],
+                }),
+            )
+        ) {
+            return;
+        }
     }
 
-    if (accountingIdentifier === undefined) {
-        ws.send(
-            JSON.stringify({
-                type: 'console',
-                level: 'error',
-                logs: [
-                    '%cAirState: Please Set appKey\n%cGet your appKey from https://console.airstate.dev',
-                    'font-size:1.5rem; font-weight: bold; padding: 1rem 0 0.3rem 0;',
-                    'font-size:1rem; font-family: monospace; padding: 0 0 1rem 0;',
-                ],
-            }),
-        );
+    if (meta.config.init_logs) {
+        for (const initialLog of meta.config.init_logs) {
+            if (
+                !send(
+                    ws,
+                    JSON.stringify({
+                        type: 'console',
+                        level: initialLog.level,
+                        logs: initialLog.arguments,
+                    }),
+                )
+            ) {
+                return;
+            }
+        }
+    }
 
-        ws.send(
-            JSON.stringify({
-                type: 'error',
-                message:
-                    'You need to call `configure` with your `appKey`; Get your appKey from https://console.airstate.dev',
-            }),
-        );
+    if (meta.config.init_error) {
+        if (
+            !send(
+                ws,
+                JSON.stringify({
+                    type: 'error',
+                    message: meta.config.init_error,
+                }),
+            )
+        ) {
+            return;
+        }
+    }
 
-        ws.close();
+    if (meta.config.close_after_init) {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.close();
+        }
 
         return;
     }
@@ -148,7 +178,7 @@ webSocketServer.on('connection', async (ws, request) => {
         return;
     }
 
-    const key = `${accountingIdentifier}__${hashedClientSentKey}`;
+    const key = `${meta.config.accounting_identifier}__${hashedClientSentKey}`;
 
     const streamName = key;
     const subject = `room.${key}`;

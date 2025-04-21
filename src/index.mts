@@ -9,15 +9,9 @@ import { returnOf } from 'scope-utilities';
 import { AckPolicy, connect, DeliverPolicy, headers, StorageType, StringCodec } from 'nats';
 import { createHash } from 'crypto';
 import { getInitialState } from './shared-state/state.mjs';
+import { createServices } from './services.mjs';
 
-const stringCodec = StringCodec();
-const natsConnection = await connect({
-    servers: env.NATS_URLS.split(',').map((url) => url.trim()),
-});
-
-const jetStreamClient = natsConnection.jetstream();
-const jetStreamManager = await natsConnection.jetstreamManager();
-const jetStreamKV = await natsConnection.jetstream().views.kv('shared-state', { storage: StorageType.File });
+const services = await createServices();
 
 // Create Express app
 const app = express();
@@ -149,9 +143,7 @@ webSocketServer.on('connection', async (ws, request) => {
         if (wsMessage.type === 'init') {
             try {
                 const [initialState, lastSeq, isFirst] = await getInitialState(
-                    jetStreamClient,
-                    jetStreamManager,
-                    jetStreamKV,
+                    services,
                     streamName,
                     subject,
                     wsMessage.initialEncodedState,
@@ -172,14 +164,14 @@ webSocketServer.on('connection', async (ws, request) => {
                     );
                 }
 
-                await jetStreamManager.consumers.add(streamName, {
+                await services.jetStreamManager.consumers.add(streamName, {
                     name: consumerName,
                     ack_policy: AckPolicy.Explicit,
                     deliver_policy: DeliverPolicy.StartSequence,
                     opt_start_seq: lastSeq + 1,
                 });
 
-                const steamConsumer = await jetStreamClient.consumers.get(streamName, consumerName);
+                const steamConsumer = await services.jetStreamClient.consumers.get(streamName, consumerName);
 
                 const streamMessages = await steamConsumer.consume({
                     max_messages: 1,
@@ -192,7 +184,7 @@ webSocketServer.on('connection', async (ws, request) => {
                         ws.send(
                             JSON.stringify({
                                 type: 'update',
-                                encodedUpdate: stringCodec.decode(streamMessage.data),
+                                encodedUpdate: services.natsStringCodec.decode(streamMessage.data),
                             }),
                         );
                     }
@@ -213,9 +205,13 @@ webSocketServer.on('connection', async (ws, request) => {
             }
         } else if (wsMessage.type === 'update') {
             try {
-                await jetStreamClient.publish(subject, stringCodec.encode(wsMessage.encodedUpdate), {
-                    headers: publishHeaders,
-                });
+                await services.jetStreamClient.publish(
+                    subject,
+                    services.natsStringCodec.encode(wsMessage.encodedUpdate),
+                    {
+                        headers: publishHeaders,
+                    },
+                );
             } catch (err) {
                 logger.error('Failed to publish update:', err);
             }
@@ -226,7 +222,7 @@ webSocketServer.on('connection', async (ws, request) => {
         logger.info('closing connection');
 
         try {
-            await jetStreamManager.consumers.delete(streamName, consumerName);
+            await services.jetStreamManager.consumers.delete(streamName, consumerName);
         } catch (err) {
             logger.error('Error deleting consumer:', err);
         }

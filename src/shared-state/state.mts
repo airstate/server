@@ -1,16 +1,15 @@
-import { JetStreamClient, JetStreamManager, KV, NatsError, StorageType } from 'nats';
+import { NatsError, StorageType } from 'nats';
 import { getMergedUpdate } from './updates.mjs';
+import { NATSServices } from '../types/nats.mjs';
 
 export async function getInitialState(
-    jetStreamClient: JetStreamClient,
-    jetStreamManager: JetStreamManager,
-    jetStreamKV: KV,
+    nats: NATSServices,
     streamName: string,
     subject: string,
     clientSentInitialState: string,
 ): Promise<[string, number, boolean]> {
     try {
-        await jetStreamKV.create(
+        await nats.sharedStateKV.create(
             `${streamName}__coordinator`,
             JSON.stringify({
                 lastSeq: 0,
@@ -18,7 +17,7 @@ export async function getInitialState(
             }),
         );
 
-        await jetStreamManager.streams.add({
+        await nats.jetStreamManager.streams.add({
             name: streamName,
             subjects: [subject],
             storage: StorageType.File,
@@ -28,7 +27,7 @@ export async function getInitialState(
         return [clientSentInitialState, 0, true];
     } catch (err) {
         if (err instanceof NatsError && err.code === '400' && err.message.includes('wrong last sequence')) {
-            const coordinatorValue = await jetStreamKV.get(`${streamName}__coordinator`);
+            const coordinatorValue = await nats.sharedStateKV.get(`${streamName}__coordinator`);
 
             if (coordinatorValue && coordinatorValue.string()) {
                 const coordinatorValueJSON = JSON.parse(coordinatorValue.string()) as {
@@ -38,14 +37,13 @@ export async function getInitialState(
 
                 try {
                     const [mergedUpdate, lastSeq] = await getMergedUpdate(
-                        jetStreamClient,
-                        jetStreamManager,
+                        nats,
                         streamName,
                         coordinatorValueJSON.lastSeq,
                         coordinatorValueJSON.lastMergedUpdate,
                     );
 
-                    await jetStreamKV.put(
+                    await nats.sharedStateKV.put(
                         `${streamName}__coordinator`,
                         JSON.stringify({
                             lastSeq,
@@ -60,7 +58,7 @@ export async function getInitialState(
                         mergeErr.code === '404' &&
                         mergeErr.message.includes('stream not found')
                     ) {
-                        await jetStreamKV.delete(`${streamName}__coordinator`);
+                        await nats.sharedStateKV.delete(`${streamName}__coordinator`);
                     }
 
                     throw mergeErr;

@@ -1,19 +1,19 @@
 import { AckPolicy, DeliverPolicy, JetStreamClient, JetStreamManager, StringCodec } from 'nats';
 import { nanoid } from 'nanoid';
 import * as Y from 'yjs';
+import { JetStreamServices } from '../types/nats.mjs';
 
 const stringCodec = StringCodec();
 
 export async function getMergedUpdate(
-    jetStreamClient: JetStreamClient,
-    jetStreamManager: JetStreamManager,
+    jetStream: JetStreamServices,
     streamName: string,
     lastSeq: number,
     lastMergedUpdate: string,
 ): Promise<[string, number]> {
     const ephemeralConsumerName = `coordinator_consumer_${nanoid()}`;
 
-    await jetStreamManager.consumers.add(streamName, {
+    await jetStream.jetStreamManager.consumers.add(streamName, {
         name: ephemeralConsumerName,
         deliver_policy: DeliverPolicy.StartSequence,
         opt_start_seq: lastSeq + 1,
@@ -24,7 +24,7 @@ export async function getMergedUpdate(
     let lastMerged: Uint8Array = Uint8Array.from(Buffer.from(lastMergedUpdate, 'base64'));
     let currSeq = lastSeq;
 
-    const ephemeralStreamConsumer = await jetStreamClient.consumers.get(streamName, ephemeralConsumerName);
+    const ephemeralStreamConsumer = await jetStream.jetStreamClient.consumers.get(streamName, ephemeralConsumerName);
 
     while (true) {
         let updates: Uint8Array[] = [];
@@ -49,7 +49,7 @@ export async function getMergedUpdate(
         lastMerged = Y.mergeUpdatesV2([lastMerged, ...updates]);
     }
 
-    await jetStreamManager.consumers.delete(streamName, ephemeralConsumerName);
+    await jetStream.jetStreamManager.consumers.delete(streamName, ephemeralConsumerName);
 
     return [Buffer.from(lastMerged).toString('base64'), currSeq];
 }

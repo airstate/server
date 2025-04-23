@@ -12,6 +12,9 @@ import { getInitialState } from './shared-state/state.mjs';
 import { createServices } from './services.mjs';
 import { TClientMeta } from './types/ws.mjs';
 import { configSchema } from './schema/config.mjs';
+import { tokenPayloadSchema } from './schema/tokenPayload.mjs';
+import { NatsError } from 'nats';
+import jwt from 'jsonwebtoken';
 
 const services = await createServices();
 
@@ -48,12 +51,11 @@ server.on('upgrade', async (request, socket, head) => {
                     if (joiningToken) {
                         configRequestURL.searchParams.set('joiningToken', joiningToken);
                     }
-
                     const configRequest = await fetch(`${configRequestURL}`);
                     return configSchema.parse(await configRequest.json());
                 } catch (error) {
                     logger.error(`could not get config for ${appKey}`, error);
-                    return null;
+                    return {};
                 }
             } else {
                 return {};
@@ -90,6 +92,17 @@ server.on('upgrade', async (request, socket, head) => {
     }
 });
 
+function validateToken(token: string, signingSecret: string) {
+    try {
+        const decodedToken = jwt.verify(token, signingSecret);
+        const parsedToken = tokenPayloadSchema.parse(decodedToken);
+        return parsedToken.permission;
+    } catch (error) {
+        logger.error(`Token validation failed`, error);
+        return null;
+    }
+}
+
 export function send(ws: WebSocket, message: string) {
     try {
         if (ws.readyState === WebSocket.OPEN) {
@@ -107,7 +120,6 @@ export function send(ws: WebSocket, message: string) {
 webSocketServer.on('connection', async (ws, request) => {
     const url = new URL(`https://airstate${request.url}`);
     const connID = nanoid();
-
     const publishHeaders = headers();
     publishHeaders.set('connID', connID);
 
@@ -178,6 +190,55 @@ webSocketServer.on('connection', async (ws, request) => {
         return;
     }
 
+    const clientSentToken = url.searchParams.get('joining-token');
+    const defaultStatePermission = meta.config.default_state_permission ?? env.DEFAULT_STATE_PERMISSION;
+    const signingSecret = meta.config.signing_secret ?? env.SHARED_SIGNING_KEY;
+    const permissionRequiresAuth = defaultStatePermission === 'none' || defaultStatePermission === 'read';
+
+    if (permissionRequiresAuth && !signingSecret) {
+        send(
+            ws,
+            JSON.stringify({
+                type: 'error',
+                message: 'No signing secret provided but is required if default state permission is read or none',
+            }),
+        );
+        logger.error('No signing secret provided but is required if default state permission is read or none');
+        ws.close();
+        return;
+    }
+
+    if (permissionRequiresAuth && !clientSentToken) {
+        send(
+            ws,
+            JSON.stringify({
+                type: 'error',
+                message: 'You must provide a valid signed token',
+            }),
+        );
+        logger.error('No token provided by the client but is required if default state permission is read or none');
+        ws.close();
+        return;
+    }
+
+    const clientPermission = permissionRequiresAuth
+        ? validateToken(clientSentToken as string, signingSecret as string)
+        : defaultStatePermission;
+
+    if (!clientPermission && defaultStatePermission === 'none') {
+        send(
+            ws,
+            JSON.stringify({
+                type: 'error',
+                message: 'Invalid token provided. Permission denied',
+            }),
+        );
+        ws.close();
+        return;
+    }
+
+    const canWrite = clientPermission === 'read-write';
+
     const key = `${meta.config.accounting_identifier}__${hashedClientSentKey}`;
 
     const streamName = key;
@@ -188,6 +249,25 @@ webSocketServer.on('connection', async (ws, request) => {
         const wsMessage = JSON.parse(message.toString('utf-8'));
 
         if (wsMessage.type === 'init') {
+            if (!canWrite) {
+                try {
+                    await services.jetStreamManager.streams.info(streamName);
+                } catch (err) {
+                    if (err instanceof NatsError && err.code === '404' && err.api_error?.err_code === 10059) {
+                        ws.send(
+                            JSON.stringify({
+                                type: 'console',
+                                level: 'warn',
+                                logs: [
+                                    '%cNote: There is still no update in this room to read.',
+                                    'padding: 0.5rem 0 0.5rem 0;',
+                                ],
+                            }),
+                        );
+                        return;
+                    }
+                }
+            }
             try {
                 const [initialState, lastSeq, isFirst] = await getInitialState(
                     services,
@@ -250,7 +330,7 @@ webSocketServer.on('connection', async (ws, request) => {
 
                 ws.close();
             }
-        } else if (wsMessage.type === 'update') {
+        } else if (wsMessage.type === 'update' && canWrite) {
             try {
                 await services.jetStreamClient.publish(
                     subject,

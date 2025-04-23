@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const configSchema = z.object({
     signing_secret: z.string().optional(),
     accounting_identifier: z.string().optional(),
+    default_state_permission: z.enum(['read', 'read-write', 'none']).optional(),
     init_logs: z
         .array(
             z.object({

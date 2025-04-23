@@ -26,7 +26,7 @@ export async function getInitialState(
 
         return [clientSentInitialState, 0, true];
     } catch (err) {
-        if (err instanceof NatsError && err.code === '400' && err.message.includes('wrong last sequence')) {
+        if (err instanceof NatsError && err.code === '400' && err.api_error?.err_code === 10071) {
             const coordinatorValue = await nats.sharedStateKV.get(`${streamName}__coordinator`);
 
             if (coordinatorValue && coordinatorValue.string()) {
@@ -56,7 +56,7 @@ export async function getInitialState(
                     if (
                         mergeErr instanceof NatsError &&
                         mergeErr.code === '404' &&
-                        mergeErr.message.includes('stream not found')
+                        mergeErr.api_error?.err_code === 10059
                     ) {
                         await nats.sharedStateKV.delete(`${streamName}__coordinator`);
                     }

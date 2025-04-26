@@ -3,7 +3,7 @@ import { z } from 'zod';
 export const configSchema = z.object({
     signing_secret: z.string().optional(),
     accounting_identifier: z.string().optional(),
-    init_logs: z
+    connection_messages: z
         .array(
             z.object({
                 level: z.enum(['debug', 'info', 'warning', 'error']),
@@ -11,7 +11,7 @@ export const configSchema = z.object({
             }),
         )
         .optional(),
-    init_error: z.string().optional(),
+    connection_error: z.string().optional(),
     close_after_init: z.boolean().optional(),
 });
 

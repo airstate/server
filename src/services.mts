@@ -21,3 +21,5 @@ export async function createServices(): Promise<NATSServices> {
         sharedStateKV,
     };
 }
+
+export type TServices = Awaited<ReturnType<typeof createServices>>;
